@@ -6,33 +6,33 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from src.data_live.utils.transform_utils import (
-    clean_numeric_columns,
+    # clean_numeric_columns,
     parse_mixed_dates,
     to_snake_case,
 )
 from src.data_live.utils.minio_client import filter_by_sheet_watermark
 
 
-NUMERIC_COLS = [
-    "Nilai barang dagangan bruto (LIVE) (Rp)",
-    "Produk yang ditambahkan",
-    "Produk Terjual",
-    "Pesanan SKU yang dibuat",
-    "Pesanan SKU (LIVE)",
-    "Produk yang terjual dari LIVE",
-    "Pembeli",
-    "Harga Rata-Rata (Rp)",
-    "GMV yang didapat dari LIVE (Rp)",
-    "Penonton",
-    "Live Stream Dilihat",
-    "Durasi menonton rata-rata (Siaran LIVE)",
-    "Komentar",
-    "Live Dibagikan",
-    "Suka pada LIVE",
-    "Pengikut baru (Video kreator)",
-    "Produk Dilihat",
-    "Klik Produk",
-]
+# NUMERIC_COLS = [
+#     "Nilai barang dagangan bruto (LIVE) (Rp)",
+#     "Produk yang ditambahkan",
+#     "Produk Terjual",
+#     "Pesanan SKU yang dibuat",
+#     "Pesanan SKU (LIVE)",
+#     "Produk yang terjual dari LIVE",
+#     "Pembeli",
+#     "Harga Rata-Rata (Rp)",
+#     "GMV yang didapat dari LIVE (Rp)",
+#     "Penonton",
+#     "Live Stream Dilihat",
+#     "Durasi menonton rata-rata (Siaran LIVE)",
+#     "Komentar",
+#     "Live Dibagikan",
+#     "Suka pada LIVE",
+#     "Pengikut baru (Video kreator)",
+#     "Produk Dilihat",
+#     "Klik Produk",
+# ]
 
 
 def _canon(x):
@@ -52,10 +52,11 @@ def build_bronze_live(
     Output: (df siap di-load ke BRONZE_DB.bronze_live, sheet_max_dates)
     """
     # numeric cleaning
-    tiktok_live_clean1 = clean_numeric_columns(
-        tiktok_live_raw, NUMERIC_COLS, fillna_value=0
-    )
+    # tiktok_live_clean1 = clean_numeric_columns(
+    #     tiktok_live_raw, NUMERIC_COLS, fillna_value=0
+    # )
 
+    tiktok_live_clean1 = tiktok_live_raw.copy()
     tiktok_live_clean1["Tanggal"] = parse_mixed_dates(
         tiktok_live_clean1["Tanggal"], return_date=False
     )
