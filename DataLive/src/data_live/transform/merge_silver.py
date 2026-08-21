@@ -1,6 +1,6 @@
 # src/data_live/transform/merge_silver.py
 from pathlib import Path
-from data_live.utils.bq_client import get_bq_client
+from src.data_live.utils.bq_client import get_bq_client
 
 
 def merge_to_silver():

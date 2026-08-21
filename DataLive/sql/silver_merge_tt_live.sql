@@ -1,4 +1,4 @@
-MERGE `database-sigma.SILVER_DB.silver_tt_live` T
+MERGE `database-sigma.Testing.silver_tt_live` T
 USING (
   WITH latest_raw AS (
     SELECT * EXCEPT(rn) FROM (
@@ -10,7 +10,7 @@ USING (
                             b.pukul_live
                ORDER BY b.snapshot_ts DESC, b.run_id DESC
              ) rn
-      FROM `database-sigma.BRONZE_DB.bronze_live` b
+      FROM `database-sigma.Testing.bronze_live` b
     )
     WHERE rn = 1
   ),
