@@ -10,13 +10,13 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from src.data_live.utils.gsheet_client import get_gspread_client
-from src.data_live.utils.bq_client import get_bq_client
 from src.data_live.utils.minio_client import (
     get_minio_client,
     get_sheet_watermarks,
     update_sheet_watermarks,
     write_quarantine,
     sync_error_manifest,
+    filter_already_quarantined,
 )
 from src.data_live.utils.transform_utils import (
     NUMERIC_COLS,
@@ -28,7 +28,6 @@ from src.data_live.ingestion.fetch_data_live_gsheet import (
     SHEET_REGISTRY,
 )
 from src.data_live.transform.clean_bronze import build_bronze_live
-from src.data_live.transform.merge_silver_duckdb import test_merge_to_silver_duckdb
 from src.data_live.transform.merge_silver import merge_to_silver
 from src.data_live.load.load_to_bigquery import load_df
 
@@ -109,7 +108,6 @@ def run_daily_etl():
 
     # 1) Client
     gc = get_gspread_client()
-    bq_client = get_bq_client()
     creds = _get_credentials()
     minio_client, minio_bucket = get_minio_client()
 
@@ -120,11 +118,8 @@ def run_daily_etl():
     run_key = today_obj.strftime("%Y%m%d%H")
 
     # 3) Per-sheet watermark check
-    # sheet_registry: name -> creds (spreadsheet ID) agar FAILSAFE migrasi format
-    # lama (sheet_name) & resolusi sheet_name baru memakai key yang benar.
-    sheet_registry = {name: os.getenv(env_key) for name, env_key in SHEET_REGISTRY.items()}
     watermark_map, watermark_records = get_sheet_watermarks(
-        minio_client, minio_bucket, WATERMARK_PATH, sheet_registry=sheet_registry
+        minio_client, minio_bucket, WATERMARK_PATH
     )
 
     # 4) Ingest from GSheet (each sheet tagged with sheet_name)
@@ -155,8 +150,13 @@ def run_daily_etl():
     # Resolved entries feed PATH A (error recovery) below.
     resolved = sync_error_manifest(minio_client, minio_bucket, df_error, v_report, today_key, run_key, df_valid=df_valid)
 
-    if not df_error.empty:
-        write_quarantine(minio_client, minio_bucket, df_error, today_key, run_key)
+    df_error_new = (
+        filter_already_quarantined(minio_client, minio_bucket, df_error)
+        if not df_error.empty
+        else df_error
+    )
+    if not df_error_new.empty:
+        write_quarantine(minio_client, minio_bucket, df_error_new, today_key, run_key)
 
     # PATH A: recovered rows (fixed since last run) bypass the watermark.
     df_recovered = _select_recovered(df_valid, resolved, v_report)
@@ -208,10 +208,9 @@ def run_daily_etl():
     )
     print(f"[MINIO] Successfully uploaded Parquet file to: {file_path}")
 
-    # 7) Update per-sheet watermark (selalu tulis format baru)
+    # 7) Update per-sheet watermark
     update_sheet_watermarks(
         minio_client, minio_bucket, WATERMARK_PATH, watermark_records, sheet_max_dates,
-        sheet_registry=sheet_registry,
     )
 
     # 8) Testing Load to Bronze & Silver via DuckDB (In-Memory)
