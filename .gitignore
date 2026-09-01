@@ -1,3 +1,13 @@
+ # Python
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets
 .env
-run_daily_etl_original.py
+
+# Testing
 PLANNING_STAGE.md
+
+# Original Frame Work
+run_daily_etl_original.py

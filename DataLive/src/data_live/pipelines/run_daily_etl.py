@@ -32,7 +32,7 @@ from src.data_live.transform.merge_silver import merge_to_silver
 from src.data_live.load.load_to_bigquery import load_df
 
 PROJECT_ID = "database-sigma"
-WATERMARK_PATH = "watermarks/data_live.json"
+WATERMARK_PATH = "watermarks/data_live_toko.json"
 
 
 def _get_credentials():
@@ -47,9 +47,10 @@ def _select_recovered(
 ) -> pd.DataFrame:
     """PATH A: select rows from df_valid that were recovered from a resolved error.
 
-    A resolved entry (sheet_name, creds, error_date) means the key was in the
-    error manifest last run but is NO LONGER in df_error this run (the data
-    got fixed). Those rows bypass the watermark filter downstream.
+    Grain is (sheet_name, creds, toko, error_date) — toko verbatim. A resolved
+    entry means the key was in the error manifest last run but is NO LONGER
+    in df_error this run (the data got fixed). Those rows bypass the watermark
+    filter downstream.
 
     Full recovery only: we include the key's rows ONLY when the number of
     valid rows now equals the manifest n_rows. Otherwise the group is either
@@ -73,10 +74,24 @@ def _select_recovered(
         report.setdefault("recovery_absent", 0)
         return df.iloc[0:0]
 
+    # Toko verbatim — column is "Toko" raw, fallback "toko" or ""
+    if "Toko" in df.columns:
+        toko_series = df["Toko"].astype(str)
+    elif "toko" in df.columns:
+        toko_series = df["toko"].astype(str)
+    else:
+        toko_series = pd.Series("", index=df.index, dtype=str)
+
+    try:
+        tanggal_str = df["Tanggal"].dt.date.astype(str)
+    except Exception:
+        tanggal_str = pd.to_datetime(df["Tanggal"]).dt.date.astype(str)
+
     key_series = (
         df["sheet_name"].astype(str)
         + "|" + df["creds"].astype(str)
-        + "|" + df["Tanggal"].dt.date.astype(str)
+        + "|" + toko_series
+        + "|" + tanggal_str
     )
 
     match = pd.Series(False, index=df.index)
@@ -84,7 +99,7 @@ def _select_recovered(
     absent = 0
 
     for r in resolved:
-        key = f'{r["sheet_name"]}|{r["creds"]}|{r["error_date"]}'
+        key = f'{r["sheet_name"]}|{r["creds"]}|{r.get("toko") or ""}|{r["error_date"]}'
         grp = df.index[key_series == key]
         n_expected = int(r.get("n_rows") or 0)
 
@@ -136,7 +151,7 @@ def run_daily_etl():
     )
     print(
         f"[VALIDATE] Rows valid: {len(df_valid)} | bad rows: {v_report['n_bad_rows']} "
-        f"(date errors: {v_report['n_date_errors']}) | blank rows dropped: {v_report['n_blank_rows']}"
+        f"(date errors: {v_report['n_date_errors']} | toko_blank: {v_report.get('n_toko_blank',0)}) | blank rows dropped: {v_report['n_blank_rows']}"
     )
     if v_report["has_changes"]:
         print(f"[VALIDATE] Corrupted/Shifted columns: {v_report['affected_columns']}")
@@ -208,13 +223,13 @@ def run_daily_etl():
     )
     print(f"[MINIO] Successfully uploaded Parquet file to: {file_path}")
 
-    # 7) Update per-sheet watermark
+    # 7) Update per-(creds,sheet_name,toko) watermark — triple grain, flush again
+    # sheet_name is part of the key, no creds_sheet_map needed (kept optional for compat)
     update_sheet_watermarks(
         minio_client, minio_bucket, WATERMARK_PATH, watermark_records, sheet_max_dates,
     )
 
-    # 8) Testing Load to Bronze & Silver via DuckDB (In-Memory)
-    # test_merge_to_silver_duckdb(df_bronze)
+    # 8) Load : Bronze
 
     load_df(
         df_bronze,
@@ -225,7 +240,7 @@ def run_daily_etl():
     )
     print("[BRONZE] Load to BRONZE_DB.bronze_produk DONE")
 
-    # 4) Silver: MERGE
+    # 9) Merge : Silver
     print("[SILVER] Running MERGE into SILVER_DB.silver_tt_produk ...")
     merge_to_silver()
     print("[SILVER] MERGE DONE")

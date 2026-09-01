@@ -6,34 +6,10 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from src.data_live.utils.transform_utils import (
-    # clean_numeric_columns,
     parse_mixed_dates,
     to_snake_case,
 )
 from src.data_live.utils.minio_client import filter_by_sheet_watermark
-
-
-# NUMERIC_COLS = [
-#     "Nilai barang dagangan bruto (LIVE) (Rp)",
-#     "Produk yang ditambahkan",
-#     "Produk Terjual",
-#     "Pesanan SKU yang dibuat",
-#     "Pesanan SKU (LIVE)",
-#     "Produk yang terjual dari LIVE",
-#     "Pembeli",
-#     "Harga Rata-Rata (Rp)",
-#     "GMV yang didapat dari LIVE (Rp)",
-#     "Penonton",
-#     "Live Stream Dilihat",
-#     "Durasi menonton rata-rata (Siaran LIVE)",
-#     "Komentar",
-#     "Live Dibagikan",
-#     "Suka pada LIVE",
-#     "Pengikut baru (Video kreator)",
-#     "Produk Dilihat",
-#     "Klik Produk",
-# ]
-
 
 def _canon(x):
     import pandas as pd
@@ -48,13 +24,10 @@ def build_bronze_live(
     """
     Dari raw GSheet → cleaning numeric + tanggal + snake_case,
     tambah snapshot_ts, snapshot_date, run_id, row_hash_raw.
-    Filter incremental per sheet_name berdasarkan watermark (sheet_watermarks).
-    Output: (df siap di-load ke BRONZE_DB.bronze_live, sheet_max_dates)
+    Filter incremental per (creds,sheet_name,toko) berdasarkan watermark (sheet_watermarks).
+    Watermark grain is (creds, sheet_name, toko) — toko verbatim, blank toko already quarantined upstream.
+    Output: (df siap di-load ke BRONZE_DB.bronze_live, sheet_max_dates: {(creds,sheet_name,toko): iso_date})
     """
-    # numeric cleaning
-    # tiktok_live_clean1 = clean_numeric_columns(
-    #     tiktok_live_raw, NUMERIC_COLS, fillna_value=0
-    # )
 
     tiktok_live_clean1 = tiktok_live_raw.copy()
     tiktok_live_clean1["Tanggal"] = parse_mixed_dates(
@@ -91,10 +64,15 @@ def build_bronze_live(
 
     df = df.loc[:, df.columns != ""]
 
-    # Filter incremental per sheet (creds-keyed) berdasarkan watermark
-    if "creds" in df.columns:
+    # Filter incremental per (creds,sheet_name,toko) — triple grain verbatim
+    if "creds" in df.columns and "sheet_name" in df.columns and "toko" in df.columns:
         df, sheet_max_dates = filter_by_sheet_watermark(
-            df, "creds", "tanggal", sheet_watermarks or {}
+            df, "creds", "sheet_name", "toko", "tanggal", sheet_watermarks or {}
+        )
+    elif "creds" in df.columns and "toko" in df.columns:
+        # fallback without sheet_name (should not happen after quarantine)
+        df, sheet_max_dates = filter_by_sheet_watermark(
+            df, "creds", "sheet_name", "toko", "tanggal", sheet_watermarks or {}
         )
     else:
         sheet_max_dates = {}
