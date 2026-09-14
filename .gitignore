@@ -8,6 +8,10 @@ __pycache__/
 
 # Testing
 PLANNING_STAGE.md
+AGENTS.md
 
 # Original Frame Work
 run_daily_etl_original.py
+
+# ETL logs
+logs/
