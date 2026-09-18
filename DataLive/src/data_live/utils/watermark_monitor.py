@@ -185,9 +185,11 @@ def compare_watermark_vs_sheet(
                 "status": "ok" if pd.notna(sheet_max) else "no data found",
             })
 
-    df_out = pd.DataFrame(rows)
-    if "is_behind" not in df_out.columns:
-        df_out["is_behind"] = pd.Series(dtype=bool)
+    df_out = pd.DataFrame(rows, columns=[
+        "sheet_name", "grain", "logical_sheet", "sheet_max_tanggal",
+        "last_processed_date", "is_behind", "status",
+    ])
+    df_out["is_behind"] = df_out["is_behind"].fillna(False).astype(bool)
     return df_out
 
 

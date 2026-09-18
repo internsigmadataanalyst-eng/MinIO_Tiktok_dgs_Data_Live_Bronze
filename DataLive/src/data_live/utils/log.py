@@ -14,7 +14,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-PIPELINE_NAME = "data_live"
+PIPELINE_NAME = os.getenv("PIPELINE_NAME", "DATA LIVE")
 
 # Module-level JSON-lines event logger state.
 _event_file = None
