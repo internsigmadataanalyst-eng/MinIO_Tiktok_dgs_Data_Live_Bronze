@@ -6,9 +6,13 @@ __pycache__/
 # Secrets
 .env
 
-# Testing
+# Local docs / agent notes (not test artifacts)
 PLANNING_STAGE.md
 AGENTS.md
+
+# Dev-only test harnesses (not part of the runtime ETL)
+verify_quarantine_v2.py
+test_emails/
 
 # Original Frame Work
 run_daily_etl_original.py

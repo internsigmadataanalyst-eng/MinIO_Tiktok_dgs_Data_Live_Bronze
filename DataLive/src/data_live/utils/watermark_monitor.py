@@ -5,7 +5,7 @@ Compares the live GSheet state against the stored MinIO watermark to decide
 whether each sheet has new data worth processing.
 
 Gate rule: every sheet (matz..imam) must have at least 1 toko group
-where live tanggal > watermark date. If any sheet has 0 toko groups behind
+where live tanggal > watermark date. If any sheet has 0 toko groups needing update
 (or an access error), the ETL aborts.
 """
 import gspread
@@ -129,7 +129,7 @@ def compare_watermark_vs_sheet(
 
     Returns a DataFrame with columns:
         sheet_name, grain, logical_sheet, sheet_max_tanggal,
-        last_processed_date, is_behind, status
+        last_processed_date, needs_update, status
     """
     rows = []
     for registry_key in registry_keys:
@@ -137,7 +137,7 @@ def compare_watermark_vs_sheet(
             rows.append({
                 "sheet_name": registry_key, "grain": None, "logical_sheet": logical_name,
                 "sheet_max_tanggal": None, "last_processed_date": None,
-                "is_behind": False, "status": "registry_key not found in sheet_registry",
+                "needs_update": False, "status": "registry_key not found in sheet_registry",
             })
             continue
 
@@ -147,7 +147,7 @@ def compare_watermark_vs_sheet(
             rows.append({
                 "sheet_name": registry_key, "grain": None, "logical_sheet": logical_name,
                 "sheet_max_tanggal": None, "last_processed_date": None,
-                "is_behind": False, "status": "spreadsheet object not found",
+                "needs_update": False, "status": "spreadsheet object not found",
             })
             continue
 
@@ -165,7 +165,7 @@ def compare_watermark_vs_sheet(
             rows.append({
                 "sheet_name": registry_key, "grain": None, "logical_sheet": logical_name,
                 "sheet_max_tanggal": None, "last_processed_date": None,
-                "is_behind": False, "status": f"error: {e}",
+                "needs_update": False, "status": f"error: {e}",
             })
             continue
 
@@ -181,15 +181,15 @@ def compare_watermark_vs_sheet(
                 "logical_sheet": logical_name,
                 "sheet_max_tanggal": sheet_max,
                 "last_processed_date": last_processed,
-                "is_behind": bool(pd.notna(sheet_max) and sheet_max > last_processed),
+                "needs_update": bool(pd.notna(sheet_max) and sheet_max > last_processed),
                 "status": "ok" if pd.notna(sheet_max) else "no data found",
             })
 
     df_out = pd.DataFrame(rows, columns=[
         "sheet_name", "grain", "logical_sheet", "sheet_max_tanggal",
-        "last_processed_date", "is_behind", "status",
+        "last_processed_date", "needs_update", "status",
     ])
-    df_out["is_behind"] = df_out["is_behind"].fillna(False).astype(bool)
+    df_out["needs_update"] = df_out["needs_update"].fillna(False).astype(bool)
     return df_out
 
 

@@ -21,6 +21,7 @@ from src.data_live.pipelines.config import (
     TGT_BQ_BRONZE,
     TGT_BQ_SILVER,
     WHITELIST_SHEETS,
+    QUARANTINE_RECOVERY_MAX_AGE_DAYS,
     BQ_TARGETS,
     _failure_ctx,
     bq_full_load,
@@ -35,6 +36,7 @@ from src.data_live.utils.minio_client import (
     write_quarantine,
     sync_error_manifest,
     filter_already_quarantined,
+    get_open_error_entries,
     QUARANTINE_PREFIX,
 )
 from src.data_live.utils.transform_utils import (
@@ -116,6 +118,57 @@ def _write_failure_log(log_folder, run_key, reason):
     write_section_log(log_folder, f"etl_failed_{run_key}.log", "\n".join(lines) + "\n")
 
 
+def _quarantine_write(stage: str, minio_files: list, rollback_hint: str, fn, args: tuple = (), kwargs: dict | None = None):
+    """Runs one quarantine-side MinIO write; on failure annotates the failure
+    context and re-raises.
+
+    Deliberately fail-closed: the two quarantine writes (parquet evidence, then
+    the manifest index) are ordered so that aborting between them can never lose
+    data. Because the watermark is only advanced much later, a plain re-run always
+    retries from the same state — the rollback_hint tells the operator exactly that.
+    """
+    try:
+        return fn(*args, **(kwargs or {}))
+    except Exception as e:
+        emit(
+            "QUARANTINE", "quarantine_writer",
+            f"{stage} failed: {type(e).__name__} {e}",
+            level="ERROR",
+            metrics={"stage": stage, "error": str(e)},
+            source=SRC_GSHEET,
+            target=TGT_MINIO_QUARANTINE,
+        )
+        _failure_ctx.update({
+            "stage": stage,
+            "minio_files": minio_files,
+            "rollback_hint": rollback_hint,
+        })
+        raise
+
+
+def _split_recovery_entries(entries: list[dict], max_age_days: int) -> tuple[list[dict], list[dict]]:
+    """Splits open error entries into (within_cap, expired) by age.
+
+    `entries` comes from get_open_error_entries, which already attaches
+    `age_days`. Entries without a parseable timestamp are treated as fresh, so a
+    malformed `open_since` can never silently expire a real defect.
+    """
+    within, expired = [], []
+    for e in entries:
+        age = float(e.get("age_days") or 0.0)
+        (within if age <= max_age_days else expired).append(e)
+    return within, expired
+
+
+def _recovery_label(e: dict) -> str:
+    """One-line human label for a stuck/pending quarantine entry."""
+    return (
+        f"{e.get('sheet_name')}/{e.get('toko') or '-'} "
+        f"{e.get('error_date')} n_rows={e.get('n_rows')} "
+        f"age={e.get('age_days')}d reasons={'|'.join(e.get('error_reasons') or []) or '-'}"
+    )
+
+
 def run_daily_etl(dry_run: bool | None = None):
     print("== Start ETL Data Live ==")
 
@@ -155,12 +208,78 @@ def run_daily_etl(dry_run: bool | None = None):
     print("=" * 70)
     status_df = data_live_watermark_check(spreadsheet_objects, minio_client, minio_bucket)
 
+    # 2C) RECOVERY-AWARE GATE.
+    # needs_update is a pure watermark-date comparison, so a sheet whose ONLY
+    # outstanding work is a pending quarantine recovery looks "caught up" and
+    # Gate 2 would abort the run BEFORE PATH A ever runs — the fixed rows would
+    # sit in the sheet indefinitely. So an open quarantine entry also counts as
+    # work for that (sheet_name, toko) group.
+    #
+    # Bounded: an entry may only hold the gate open for
+    # QUARANTINE_RECOVERY_MAX_AGE_DAYS. After that it is reported in the
+    # gate-abort email instead, so a permanently broken entry can neither hide
+    # forever nor stall the pipeline forever.
+    recovery_pending, recovery_expired = _split_recovery_entries(
+        get_open_error_entries(minio_client, minio_bucket),
+        QUARANTINE_RECOVERY_MAX_AGE_DAYS,
+    )
+    _pending_groups = {(_e["sheet_name"], str(_e.get("toko") or "")) for _e in recovery_pending}
+    _expired_groups = {(_e["sheet_name"], str(_e.get("toko") or "")) for _e in recovery_expired}
+    _pending_age = {}
+    for _e in recovery_pending:
+        _g = (_e["sheet_name"], str(_e.get("toko") or ""))
+        _pending_age[_g] = max(_pending_age.get(_g, 0.0), float(_e.get("age_days") or 0.0))
+
+    if not status_df.empty:
+        _is_pending = [
+            (s, "" if pd.isna(g) else str(g)) in _pending_groups
+            for s, g in zip(status_df["sheet_name"], status_df["grain"])
+        ]
+        _is_expired = [
+            (s, "" if pd.isna(g) else str(g)) in _expired_groups
+            and not ((s, "" if pd.isna(g) else str(g)) in _pending_groups)
+            for s, g in zip(status_df["sheet_name"], status_df["grain"])
+        ]
+        status_df["recovery_pending"] = _is_pending
+        status_df["recovery_expired"] = _is_expired
+        # Keep the date-only verdict so the report can distinguish "new data"
+        # from "passing purely because a recovery is pending".
+        status_df["needs_update_by_date"] = status_df["needs_update"]
+        status_df["needs_update"] = status_df["needs_update"] | status_df["recovery_pending"]
+    else:
+        status_df["recovery_pending"] = pd.Series(dtype=bool)
+        status_df["recovery_expired"] = pd.Series(dtype=bool)
+        status_df["needs_update_by_date"] = pd.Series(dtype=bool)
+
+    if recovery_pending or recovery_expired:
+        print(
+            f"[GATE] Quarantine recovery pending: {len(recovery_pending)} group(s) within "
+            f"{QUARANTINE_RECOVERY_MAX_AGE_DAYS}d | {len(recovery_expired)} group(s) EXPIRED "
+            f"(no longer able to hold the gate open)"
+        )
+        for _e in recovery_expired:
+            print(
+                f"[GATE]   STUCK: sheet={_e['sheet_name']} toko={_e.get('toko') or ''} "
+                f"date={_e['error_date']} n_rows={_e.get('n_rows')} "
+                f"age={_e.get('age_days')}d — fix the sheet manually or clear the manifest entry"
+            )
+
     view = pd.DataFrame({
         "sheet_name": status_df["sheet_name"],
         "toko": status_df["grain"],
         "gsheet": status_df["sheet_max_tanggal"],
         "wm": status_df["last_processed_date"],
-        "flag": status_df["is_behind"].map({True: "BEHIND", False: "ok"}),
+        "flag": status_df["needs_update"].map({True: "UPDATE", False: "ok"}),
+        "quarantine": [
+            f"PENDING-RECOVERY ({_pending_age.get((s, '' if pd.isna(g) else str(g)), 0.0)}d)"
+            if p else ("STUCK" if e else "")
+            for s, g, p, e in zip(
+                status_df["sheet_name"],
+                status_df["grain"],
+                status_df["recovery_pending"],
+                status_df["recovery_expired"],
+            )
+        ],
     })
     print("-" * 70)
     print("DATASET: DATA LIVE (toko grain)")
@@ -176,10 +295,12 @@ def run_daily_etl(dry_run: bool | None = None):
     emit(
         "PRE_FLIGHT", "watermark_monitor",
         f"Watermark drift check: {len(status_df)} group(s), "
-        f"{int(status_df['is_behind'].sum())} behind",
+        f"{int(status_df['needs_update'].sum())} need update",
         metrics={
             "total_groups": int(len(status_df)),
-            "groups_behind": int(status_df["is_behind"].sum()),
+            "groups_needing_update": int(status_df["needs_update"].sum()),
+            "recovery_pending_groups": len(recovery_pending),
+            "recovery_expired_groups": len(recovery_expired),
         },
         source=SRC_GSHEET,
         target=SRC_MINIO,
@@ -217,26 +338,39 @@ def run_daily_etl(dry_run: bool | None = None):
                                f"access errors on sheets: {error_sheets}")
         return
 
-    # Gate 2: each sheet must have >=1 toko behind
-    sheet_passes = status_df.groupby("sheet_name")["is_behind"].any()
+    # Gate 2: each sheet must have >=1 toko needing update
+    sheet_passes = status_df.groupby("sheet_name")["needs_update"].any()
     caught_up = [s for s in sheet_passes[~sheet_passes].index.tolist() if s not in WHITELIST_SHEETS]
-    behind_sheets = sheet_passes[sheet_passes].index.tolist()
+    sheets_needing_update = sheet_passes[sheet_passes].index.tolist()
     whitelisted_skipped = [s for s in sheet_passes[~sheet_passes].index.tolist() if s in WHITELIST_SHEETS]
 
     if caught_up:
         mode = "DRY-RUN WOULD ABORT" if dry_run else "ABORT"
         print(f"[GATE] Sheets already up-to-date (skipped): {caught_up}")
-        print(f"[GATE] Sheets with new data: {behind_sheets}")
+        print(f"[GATE] Sheets with new data: {sheets_needing_update}")
         if whitelisted_skipped:
             print(f"[GATE] Whitelisted sheets : {whitelisted_skipped}")
         print(f"[GATE] {mode} - sheets with no new data are required before continuing.")
 
+        # Sheets that pass the gate purely because a quarantine recovery is
+        # pending — no new dates, but fixed rows still need re-admitting.
+        recovery_only = [
+            s for s in sheets_needing_update
+            if bool(status_df[status_df["sheet_name"] == s]["recovery_pending"].any())
+            and not bool(status_df[status_df["sheet_name"] == s]["needs_update_by_date"].any())
+        ]
+        if recovery_only:
+            print(f"[GATE] Passing on quarantine recovery only: {recovery_only}")
+
         toko_detail = []
         for sheet_name in caught_up:
             sel = status_df[status_df["sheet_name"] == sheet_name]
-            toko_without_new = sel[~sel["is_behind"]]["grain"].tolist()
+            toko_without_new = sel[~sel["needs_update"]]["grain"].tolist()
             toko_detail.append({"sheet_name": sheet_name,
                                 "toko_without_new_data": toko_without_new})
+
+        stuck_labels = [_recovery_label(e) for e in recovery_expired]
+        pending_labels = [_recovery_label(e) for e in recovery_pending]
 
         emit(
             "GATE", "etl_gate",
@@ -244,16 +378,44 @@ def run_daily_etl(dry_run: bool | None = None):
             level="ERROR",
             metrics={
                 "caught_up": caught_up,
-                "behind": behind_sheets,
+                "sheets_needing_update": sheets_needing_update,
                 "whitelisted_skipped": whitelisted_skipped,
                 "caught_up_detail": toko_detail,
                 "total_groups": int(len(status_df)),
                 "sheets_up_to_date": len(caught_up),
-                "sheets_with_new_data": len(behind_sheets),
+                "sheets_needing_update_count": len(sheets_needing_update),
+                "recovery_pending_entries": pending_labels,
+                "recovery_expired_entries": stuck_labels,
             },
             source=SRC_GSHEET,
             target=SRC_MINIO,
         )
+        email_lists = {
+            "sheets_up_to_date": caught_up,
+            "sheets_needing_update": sheets_needing_update,
+            "whitelisted_skipped": whitelisted_skipped,
+        }
+        if recovery_only:
+            email_lists["passing_on_quarantine_recovery_only"] = recovery_only
+        if stuck_labels:
+            email_lists["STUCK_quarantine_entries_no_longer_recoverable_automatically"] = stuck_labels
+        if pending_labels:
+            email_lists["quarantine_recovery_pending"] = pending_labels
+
+        gate_note = (
+            "Some tokos are already up-to-date (watermark >= sheet max). "
+            "If this is expected (no genuinely new data), no action needed; "
+            "otherwise check the source sheet dates."
+        )
+        if recovery_only or stuck_labels:
+            gate_note += (
+                " NOTE: a sheet with no new dates is also allowed through when it has a "
+                f"quarantine recovery pending (open for up to {QUARANTINE_RECOVERY_MAX_AGE_DAYS} "
+                "days), so already-fixed rows can be re-loaded. Entries past that age are "
+                "listed above as STUCK and must be fixed in the sheet or cleared from the "
+                "error manifest by hand."
+            )
+
         subject, body_html = build_gate_abort_email(
             gate="2",
             mode=mode,
@@ -261,16 +423,8 @@ def run_daily_etl(dry_run: bool | None = None):
                 "Sheets with no new data are required before continuing: "
                 f"{caught_up}"
             ),
-            lists={
-                "sheets_up_to_date": caught_up,
-                "behind_sheets": behind_sheets,
-                "whitelisted_skipped": whitelisted_skipped,
-            },
-            note=(
-                "Some tokos are already up-to-date (watermark >= sheet max). "
-                "If this is expected (no genuinely new data), no action needed; "
-                "otherwise check the source sheet dates."
-            ),
+            lists=email_lists,
+            note=gate_note,
             bq_updates=BQ_TARGETS,
             drift_rows=build_drift_rows(status_df),
             enable_explanation=not dry_run,
@@ -289,7 +443,7 @@ def run_daily_etl(dry_run: bool | None = None):
     if log_folder:
         pass_count = int(sheet_passes.sum())
         total = len(sheet_passes)
-        verdict = f"PASS — {pass_count}/{total} sheets have >=1 toko behind"
+        verdict = f"PASS — {pass_count}/{total} sheets have >=1 toko needing update"
         write_wm_log(log_folder, run_key, status_df, sheet_passes, verdict)
 
     # 3) Per-sheet watermark check
@@ -336,14 +490,20 @@ def run_daily_etl(dry_run: bool | None = None):
             f"---> {v_report['last_affected_date']}"
         )
 
-    # STEP 3Q/6: sync error manifest
+    # STEP 3Q/6: quarantine side-channel.
+    #
+    # ORDER IS LOAD-BEARING. The manifest is the index of what is quarantined;
+    # the parquet is the evidence. Writing the manifest first meant a failed
+    # parquet write left an `open` entry pointing at a file that does not exist,
+    # and the next run's filter_already_quarantined would then skip those rows as
+    # known duplicates — so the bad rows reached neither bronze nor any parquet.
+    # Evidence first, index second: a parquet failure now aborts the run with the
+    # manifest untouched, and a plain re-run re-detects and re-quarantines.
     df_error_new = (
         filter_already_quarantined(minio_client, minio_bucket, df_error)
         if not df_error.empty
         else df_error
     )
-
-    resolved = sync_error_manifest(minio_client, minio_bucket, df_error, v_report, today_key, run_key, df_valid=df_valid, dry_run=dry_run)
 
     n_dupes_skipped = max(0, len(df_error) - len(df_error_new))
     src_rows = df_error_new if not df_error_new.empty else df_error
@@ -367,10 +527,22 @@ def run_daily_etl(dry_run: bool | None = None):
         if dry_run:
             print(f"[DRY-RUN] Akan quarantine {len(df_error_new)} bad row(s)")
         else:
-            write_quarantine(minio_client, minio_bucket, df_error_new, today_key, run_key)
+            _quarantine_write(
+                stage="Quarantine parquet upload",
+                minio_files=[
+                    f"{QUARANTINE_PREFIX}/date={today_key}/",
+                    f"{QUARANTINE_PREFIX}/date={today_key}/quarantine_{run_key}.parquet",
+                ],
+                rollback_hint=(
+                    "The error manifest was NOT updated and the watermark is NOT advanced, "
+                    "so the same bad rows will be re-detected and re-quarantined on a plain "
+                    "re-run. No rollback is needed."
+                ),
+                fn=write_quarantine,
+                args=(minio_client, minio_bucket, df_error_new, today_key, run_key),
+            )
 
             if log_folder:
-                import re as _re
                 q_lines = []
                 q_lines.append(f"=== QUARANTINE REPORT - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
                 q_lines.append("Dataset: data_live")
@@ -388,7 +560,7 @@ def run_daily_etl(dry_run: bool | None = None):
                 sample = df_error_new.head(5)
                 q_lines.append(f"  Sample bad rows (first {len(sample)}):")
                 display_cols = [c for c in ["Tanggal", "tanggal", "Toko", "toko",
-                                             "ID Pesanan", "id_pesanan", "error_reason"] if c in sample.columns]
+                                             "ID Kreator", "id_kreator", "error_reason"] if c in sample.columns]
                 if display_cols:
                     header = " | ".join(f"{c:<15}" for c in display_cols)
                     q_lines.append(f"    | {header} |")
@@ -399,6 +571,21 @@ def run_daily_etl(dry_run: bool | None = None):
 
                 q_lines.append("")
                 write_section_log(log_folder, f"quarantine_errors_{run_key}.log", "\n".join(q_lines) + "\n")
+
+    # Manifest index last — only once the evidence exists.
+    resolved, readmit = _quarantine_write(
+        stage="Error manifest sync",
+        minio_files=[f"error_list_watermark/error_manifest.json"],
+        rollback_hint=(
+            "The quarantine parquet for this run WAS written, but the error manifest was "
+            "NOT updated, so those rows are not yet indexed as quarantined and the run "
+            "failed before the watermark advanced. A plain re-run re-detects them and "
+            "rewrites both. No rollback is needed."
+        ),
+        fn=sync_error_manifest,
+        args=(minio_client, minio_bucket, df_error, v_report, today_key, run_key),
+        kwargs={"df_valid": df_valid, "dry_run": dry_run},
+    )
 
     if not df_error.empty:
         emit(
@@ -438,36 +625,41 @@ def run_daily_etl(dry_run: bool | None = None):
         )
         send_alert_email(subject, body_html, dry_run=dry_run)
 
-    # PATH A: recovered rows
-    df_recovered = select_recovered(df_valid, resolved, v_report)
+    # PATH A: recovered rows.
+    # Both fully-resolved groups AND still-broken groups whose signature changed
+    # re-admit every valid row they own. The watermark cannot gate these because
+    # PATH A runs with an empty watermark map below.
+    df_recovered = select_recovered(df_valid, resolved, v_report, readmit=readmit)
     print(
         f"[RECOVERY] resolved={v_report.get('recovery_resolved', 0)} "
-        f"| recovered_rows={v_report.get('recovery_recovered_rows', 0)} "
-        f"| absent={v_report.get('recovery_absent', 0)} "
-        f"| count_mismatch_skipped={v_report.get('recovery_count_mismatch', 0)}"
+        f"| partial={v_report.get('recovery_partial', 0)} "
+        f"| readmit_rows={v_report.get('recovery_readmit_rows', 0)} "
+        f"| absent={v_report.get('recovery_absent', 0)}"
     )
     emit(
         "RECOVERY", "error_recovery",
         f"Recovery: resolved={v_report.get('recovery_resolved', 0)}, "
-        f"recovered_rows={v_report.get('recovery_recovered_rows', 0)}, "
-        f"absent={v_report.get('recovery_absent', 0)}, "
-        f"count_mismatch_skipped={v_report.get('recovery_count_mismatch', 0)}",
-        level="WARN" if v_report.get("recovery_count_mismatch", 0) or v_report.get("recovery_absent", 0) else "INFO",
+        f"partial={v_report.get('recovery_partial', 0)}, "
+        f"readmit_rows={v_report.get('recovery_readmit_rows', 0)}, "
+        f"absent={v_report.get('recovery_absent', 0)}",
+        level="WARN" if v_report.get("recovery_absent", 0) else "INFO",
         metrics={
             "resolved": int(v_report.get("recovery_resolved", 0)),
-            "recovered_rows": int(v_report.get("recovery_recovered_rows", 0)),
+            "partial": int(v_report.get("recovery_partial", 0)),
+            "readmit_rows": int(v_report.get("recovery_readmit_rows", 0)),
             "absent": int(v_report.get("recovery_absent", 0)),
-            "count_mismatch_skipped": int(v_report.get("recovery_count_mismatch", 0)),
         },
         source=SRC_GSHEET,
         target=TGT_BQ_BRONZE,
     )
-    if v_report.get("recovery_recovered_rows", 0) or v_report.get("recovery_resolved", 0):
+    if (v_report.get("recovery_readmit_rows", 0)
+            or v_report.get("recovery_resolved", 0)
+            or v_report.get("recovery_partial", 0)):
         subject, body_html = build_recovery_email(
             resolved=v_report.get("recovery_resolved", 0),
-            recovered_rows=v_report.get("recovery_recovered_rows", 0),
+            partial_entries=v_report.get("recovery_partial", 0),
+            recovered_rows=v_report.get("recovery_readmit_rows", 0),
             absent=v_report.get("recovery_absent", 0),
-            count_mismatch_skipped=v_report.get("recovery_count_mismatch", 0),
             bq_updates=BQ_TARGETS,
             enable_explanation=not dry_run,
         )
